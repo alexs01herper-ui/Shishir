@@ -1,0 +1,251 @@
+name: RDP (3 Days)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 4320  # 72 hours = 4320 minutes
+
+    steps:
+      - name: Configure Core RDP Settings
+        run: |
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Disable Network Level Authentication for compatibility
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          # Configure firewall
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>&1 | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+          # Set RDP session timeout to 3 days (259200 seconds)
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "MaxDisconnectionTime" -Value 259200000 -Force
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "MaxIdleTime" -Value 259200000 -Force
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name "MaxConnectionTime" -Value 259200000 -Force
+
+          # Restart Terminal services
+          Restart-Service -Name TermService -Force
+          Start-Sleep -Seconds 5
+
+      - name: Create RDP User with Alphanumeric Password
+        run: |
+          # Generate password with only uppercase, lowercase, and numbers
+          $uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+          $lowercase = "abcdefghijklmnopqrstuvwxyz" 
+          $numbers = "0123456789"
+          
+          # Create a stronger password with 6 uppercase, 6 lowercase, 6 numbers
+          $passwordChars = @()
+          $passwordChars += $uppercase.ToCharArray() | Get-Random -Count 6
+          $passwordChars += $lowercase.ToCharArray() | Get-Random -Count 6
+          $passwordChars += $numbers.ToCharArray() | Get-Random -Count 6
+          
+          # Shuffle the characters
+          $password = -join ($passwordChars | Sort-Object { Get-Random })
+          
+          # Create user account
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          
+          # Store credentials securely
+          echo "RDP_USER=RDP" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          # Verify user creation
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+          Write-Host "User created successfully"
+
+      - name: Install Tailscale
+        run: |
+          # Download Tailscale
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          try {
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+              Start-Process msiexec.exe -Wait -ArgumentList @(
+                  "/i",
+                  "`"$installerPath`"",
+                  "/quiet",
+                  "/norestart"
+              )
+              # Wait for installation to complete
+              Start-Sleep -Seconds 10
+          }
+          finally {
+              # Clean up installer
+              if (Test-Path $installerPath) {
+                  Remove-Item $installerPath -Force
+              }
+          }
+          
+          # Verify Tailscale installation
+          if (Test-Path "C:\Program Files\Tailscale\tailscale.exe") {
+              Write-Host "Tailscale installed successfully"
+          } else {
+              Write-Error "Tailscale installation failed"
+              exit 1
+          }
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Connect to Tailscale
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-rdp-$env:GITHUB_RUN_ID --accept-routes
+          
+          # Wait for IP assignment with better error handling
+          $maxRetries = 12
+          $retryCount = 0
+          $tsIP = $null
+          
+          while (-not $tsIP -and $retryCount -lt $maxRetries) {
+              Start-Sleep -Seconds 5
+              $tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+              $retryCount++
+              Write-Host "Attempt $retryCount/$maxRetries - IP: $tsIP"
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned after $maxRetries attempts"
+              Write-Host "Tailscale status:"
+              & "C:\Program Files\Tailscale\tailscale.exe" status
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale connected successfully - IP: $tsIP"
+
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Testing RDP connectivity to: $env:TAILSCALE_IP"
+          
+          # Test RDP port with timeout
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue
+          
+          if ($testResult) {
+              Write-Host "✓ RDP connectivity test PASSED"
+          } else {
+              Write-Host "✗ RDP connectivity test FAILED"
+              Write-Host "Checking local RDP service status..."
+              
+              # Check if RDP service is running
+              $service = Get-Service -Name TermService -ErrorAction SilentlyContinue
+              if ($service.Status -ne "Running") {
+                  Write-Host "TermService status: $($service.Status)"
+                  Write-Host "Attempting to start TermService..."
+                  Start-Service -Name TermService -ErrorAction SilentlyContinue
+                  Start-Sleep -Seconds 5
+              }
+              
+              # Test again
+              $retryTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue
+              if (-not $retryTest) {
+                  Write-Error "RDP connectivity failed after retry"
+                  exit 1
+              } else {
+                  Write-Host "✓ RDP connectivity restored after service check"
+              }
+          }
+
+      - name: Display Connection Information
+        run: |
+          Write-Host ""
+          Write-Host "═" * 50
+          Write-Host "🚀 RDP ACCESS READY - 3 DAY SESSION"
+          Write-Host "═" * 50
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "Port: 3389"
+          Write-Host "Session Duration: 72 hours (3 days)"
+          Write-Host "Start Time: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+          Write-Host "End Time: $(Get-Date).AddDays(3).ToString('yyyy-MM-dd HH:mm:ss')"
+          Write-Host "═" * 50
+          Write-Host ""
+
+      - name: Maintain Connection for 3 Days
+        run: |
+          $startTime = Get-Date
+          $timeoutHours = 72
+          $checkInterval = 300  # 5 minutes in seconds
+          
+          while ($true) {
+              $currentTime = Get-Date
+              $elapsed = $currentTime - $startTime
+              $remainingHours = $timeoutHours - $elapsed.TotalHours
+              
+              if ($remainingHours -le 0) {
+                  Write-Host "3-day session timeout reached. Shutting down..."
+                  break
+              }
+              
+              # Calculate days, hours, minutes remaining
+              $daysRemaining = [math]::Floor($remainingHours / 24)
+              $hoursRemaining = [math]::Floor($remainingHours % 24)
+              $minutesRemaining = [math]::Floor(($remainingHours * 60) % 60)
+              
+              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Session Active - Time remaining: $daysRemaining days, $hoursRemaining hours, $minutesRemaining minutes"
+              
+              # Verify Tailscale connection every 30 minutes
+              if ([math]::Round($elapsed.TotalSeconds) % 1800 -eq 0) {
+                  $tsStatus = & "C:\Program Files\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+                  if ($tsStatus -and $tsStatus.BackendState -eq "Running") {
+                      Write-Host "✓ Tailscale connection healthy"
+                  } else {
+                      Write-Host "⚠ Tailscale connection issue detected - attempting to reconnect"
+                      & "C:\Program Files\Tailscale\tailscale.exe" up --reset 2>$null
+                      Start-Sleep -Seconds 10
+                  }
+              }
+              
+              # Health check every hour
+              if ([math]::Round($elapsed.TotalSeconds) % 3600 -eq 0) {
+                  Write-Host "Performing system health check..."
+                  
+                  # Check RDP service
+                  $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+                  if ($rdpService.Status -ne "Running") {
+                      Write-Host "Restarting RDP service..."
+                      Restart-Service -Name TermService -Force
+                  }
+                  
+                  # Check disk space
+                  $disk = Get-WmiObject -Class Win32_LogicalDisk -Filter "DeviceID='C:'"
+                  $freeSpaceGB = [math]::Round($disk.FreeSpace / 1GB, 2)
+                  Write-Host "Free disk space: $freeSpaceGB GB"
+                  
+                  if ($freeSpaceGB -lt 5) {
+                      Write-Host "⚠ Warning: Low disk space"
+                  }
+              }
+              
+              Start-Sleep -Seconds $checkInterval
+          }
+
+      - name: Cleanup and Shutdown
+        if: always()
+        run: |
+          Write-Host "Starting cleanup process..."
+          
+          # Disconnect Tailscale
+          Write-Host "Disconnecting Tailscale..."
+          & "C:\Program Files\Tailscale\tailscale.exe" down 2>$null
+          
+          # Remove RDP user
+          Write-Host "Removing RDP user..."
+          Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          
+          # Reset RDP settings
+          Write-Host "Resetting RDP settings..."
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 1 -Force -ErrorAction SilentlyContinue
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          
+          Write-Host "Cleanup completed. Session ended."
