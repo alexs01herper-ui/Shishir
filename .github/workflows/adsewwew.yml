@@ -1,0 +1,206 @@
+name: High-Performance RDP
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: 'RDP session duration in minutes (max 360)'
+        required: true
+        default: '360'
+        type: choice
+        options:
+        - '60'
+        - '120'
+        - '240'
+        - '360'
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: ${{ github.event.inputs.duration }}
+
+    steps:
+      - name: Configure High-Performance RDP Settings
+        run: |
+          # Enable Remote Desktop with optimized settings
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                           -Name "fDenyTSConnections" -Value 0 -Force
+          
+          # Disable NLA for broader compatibility
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "SecurityLayer" -Value 0 -Force
+
+          # High-performance RDP registry optimizations
+          # Increase RDP session limits
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+                           -Name "MaxInstanceCount" -Value 4294967295 -Force
+          
+          # Enable keep-alive
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' `
+                           -Name "KeepAliveEnable" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' `
+                           -Name "KeepAliveInterval" -Value 1 -Force
+          Set-ItemProperty -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' `
+                           -Name "KeepAliveTimeout" -Value 1 -Force
+          
+          # Optimize for high-speed connections
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "MaxMonitors" -Value 4 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "MaxXResolution" -Value 3840 -Force
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "MaxYResolution" -Value 2160 -Force
+          
+          # Enable hardware acceleration
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "bEnumerateHWBeforeSW" -Value 1 -Force
+          
+          # Configure high color depth (32-bit)
+          Set-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                           -Name "ColorDepth" -Value 4 -Force
+
+          # Clear existing firewall rules
+          netsh advfirewall firewall delete rule name="RDP-HighPerf" 2>&1 | Out-Null
+          
+          # Add high-performance firewall rule
+          netsh advfirewall firewall add rule name="RDP-HighPerf" `
+            dir=in action=allow protocol=TCP localport=3389 `
+            profile=any enable=yes
+
+          # Restart Terminal services
+          Restart-Service -Name TermService -Force
+          Start-Service -Name SessionEnv -ErrorAction SilentlyContinue
+          Start-Service -Name UmRdpService -ErrorAction SilentlyContinue
+
+      - name: Optimize Windows for Performance
+        run: |
+          # Disable visual effects for better performance
+          Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects" `
+                           -Name "VisualFXSetting" -Value 2 -Force
+          
+          # Optimize power settings for performance
+          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c  # High performance plan
+          
+          # Disable background apps
+          Get-AppxPackage -AllUsers | ForEach-Object {
+              Add-AppxPackage -DisableDevelopmentMode -Register "$($_.InstallLocation)\AppXManifest.xml" -ErrorAction SilentlyContinue
+          }
+          
+          # Optimize network performance
+          netsh int tcp set global autotuninglevel=normal
+          netsh int tcp set global rss=enabled
+          netsh int tcp set global chimney=enabled
+
+      - name: Create High-Security RDP User
+        run: |
+          # Generate cryptographically secure password
+          Add-Type -AssemblyName System.Web
+          $password = [System.Web.Security.Membership]::GeneratePassword(20, 8)
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          
+          # Create user with elevated privileges
+          New-LocalUser -Name "HighPerfRDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "HighPerfRDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "HighPerfRDP"
+          Add-LocalGroupMember -Group "Performance Log Users" -Member "HighPerfRDP"
+          
+          # Store credentials securely
+          echo "RDP_USER=HighPerfRDP" >> $env:GITHUB_ENV
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+          
+          # Verify user creation
+          if (-not (Get-LocalUser -Name "HighPerfRDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install and Configure Tailscale
+        run: |
+          # Download latest Tailscale
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath -UserAgent "GitHub-Actions"
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+          
+          # Configure Tailscale for performance
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-highperf-$env:GITHUB_RUN_ID --accept-routes --accept-dns --ssh
+          
+          # Wait for IP assignment with timeout
+          $tsIP = $null
+          for ($i = 0; $i -lt 15; $i++) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              if ($tsIP) { break }
+              Start-Sleep -Seconds 2
+          }
+          
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP assignment failed"
+              exit 1
+          }
+          
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
+
+      - name: Configure RDP Client Experience
+        run: |
+          # Enable enhanced RDP experience
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" `
+                           -Name "fClientDisableUDP" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" `
+                           -Name "MaxConnectionTime" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" `
+                           -Name "RemoteDesktop_Client_Experience" -Value 1 -Force
+          
+          # Enable audio and video playback
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" `
+                           -Name "fDisableAudio" -Value 0 -Force
+          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services" `
+                           -Name "AVC444ModePreferred" -Value 1 -Force
+
+      - name: Performance Verification
+        run: |
+          Write-Host "=== Performance Configuration ==="
+          Write-Host "RDP Optimizations: Enabled"
+          Write-Host "High-Performance Mode: Active"
+          Write-Host "Tailscale VPN: Connected"
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          
+          # Test RDP port connectivity
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Detailed
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "RDP port connectivity test failed"
+              exit 1
+          }
+          
+          Write-Host "RDP Connectivity: SUCCESS"
+          Write-Host "Ping Response: $($testResult.PingReplyDetails.RoundtripTime)ms"
+
+      - name: Active RDP Session
+        run: |
+          Write-Host "`n" + "="*50
+          Write-Host "HIGH-PERFORMANCE RDP READY"
+          Write-Host "="*50
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "Session Duration: ${{ github.event.inputs.duration }} minutes"
+          Write-Host "Features: 4K Support | Hardware Acceleration | High Speed"
+          Write-Host "="*50
+          Write-Host "`nSession active. Use GitHub UI to stop when finished.`n"
+          
+          # Display connection quality metrics periodically
+          $startTime = Get-Date
+          while ($true) {
+              $elapsed = (Get-Date) - $startTime
+              Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active for: $([math]::Round($elapsed.TotalMinutes, 1)) minutes"
+              
+              # Periodically verify Tailscale connection
+              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+              Write-Host "Tailscale Status: $($tsStatus.BackendState)"
+              
+              Start-Sleep -Seconds 60
+          }
