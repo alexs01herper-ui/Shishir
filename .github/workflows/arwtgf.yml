@@ -1,0 +1,279 @@
+name: RDP with Ngrok01
+
+on:
+  workflow_dispatch:
+
+env:
+  RDP_USER: github-rdp-user
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+
+    steps:
+      - name: Configure RDP Settings
+        run: |
+          Write-Host "Configuring RDP settings..."
+          # Enable Remote Desktop
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          # Disable authentication requirements
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+          # Configure firewall
+          netsh advfirewall firewall delete rule name="RDP-Ngrok" 2>&1 | Out-Null
+          netsh advfirewall firewall add rule name="RDP-Ngrok" dir=in action=allow protocol=TCP localport=3389
+          # Restart service
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configuration completed"
+
+      - name: Create RDP User
+        run: |
+          Write-Host "Creating RDP user..."
+          # Remove existing user if any
+          $existingUser = Get-LocalUser -Name "$env:RDP_USER" -ErrorAction SilentlyContinue
+          if ($existingUser) {
+              Remove-LocalUser -Name "$env:RDP_USER"
+          }
+          # Generate secure password
+          function New-SecurePassword {
+              $upper = [char[]]'ABCDEFGHIJKLMNOPQRSTUVWXYZ' | Get-Random -Count 4
+              $lower = [char[]]'abcdefghijklmnopqrstuvwxyz' | Get-Random -Count 4
+              $numbers = [char[]]'0123456789' | Get-Random -Count 4
+              $special = [char[]]'!@#$%^&*' | Get-Random -Count 4
+              $allChars = $upper + $lower + $numbers + $special
+              return -join ($allChars | Sort-Object { Get-Random })
+          }
+          $password = New-SecurePassword
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          # Create user
+          New-LocalUser -Name "$env:RDP_USER" -Password $securePassword -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member "$env:RDP_USER"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "$env:RDP_USER"
+          # Store credentials
+          "RDP_PASSWORD=$password" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "User created successfully"
+
+      - name: Setup Ngrok
+        run: |
+          Write-Host "Downloading and setting up Ngrok..."
+          $ngrokUrl = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip"
+          $zipPath = "$env:TEMP\ngrok.zip"
+          $ngrokDir = "$env:TEMP\ngrok"
+          # Download ngrok
+          Invoke-WebRequest -Uri $ngrokUrl -OutFile $zipPath
+          # Extract ngrok
+          Expand-Archive -Path $zipPath -DestinationPath $ngrokDir -Force
+          Remove-Item $zipPath -Force
+          # Set environment variable
+          "NGROK_PATH=$ngrokDir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Ngrok setup completed"
+
+      - name: Start Ngrok and Get URL
+        run: |
+          Write-Host "Starting Ngrok tunnel for RDP..."
+          
+          # Kill any existing ngrok processes
+          Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 2
+          
+          # Start ngrok with log output to file
+          $logPath = "$env:TEMP\ngrok_log.txt"
+          $ngrokProcess = Start-Process -FilePath "$env:NGROK_PATH\ngrok.exe" `
+            -ArgumentList "tcp 3389 --log stdout" `
+            -RedirectStandardOutput $logPath `
+            -PassThru `
+            -WindowStyle Hidden
+          
+          "NGROK_PID=$($ngrokProcess.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Ngrok started with PID: $($ngrokProcess.Id)"
+          
+          # Wait and parse ngrok output for URL
+          Write-Host "Waiting for Ngrok tunnel to establish..."
+          $maxRetries = 30
+          $retryCount = 0
+          $publicUrl = $null
+          
+          while ($retryCount -lt $maxRetries -and -not $publicUrl) {
+              Start-Sleep -Seconds 2
+              
+              # Read ngrok log to find URL
+              if (Test-Path $logPath) {
+                  $logContent = Get-Content $logPath -Tail 20 -ErrorAction SilentlyContinue
+                  foreach ($line in $logContent) {
+                      if ($line -match "url=tcp://(.+:\d+)") {
+                          $publicUrl = "tcp://" + $matches[1]
+                          Write-Host "✅ Ngrok URL found in logs: $publicUrl"
+                          "NGROK_URL=$publicUrl" | Out-File -FilePath $env:GITHUB_ENV -Append
+                          break
+                      }
+                      # Alternative pattern matching
+                      if ($line -match "tcp://([a-z0-9.-]+:\d+)" -and -not $publicUrl) {
+                          $publicUrl = $matches[0]
+                          Write-Host "✅ Ngrok URL found (alt pattern): $publicUrl"
+                          "NGROK_URL=$publicUrl" | Out-File -FilePath $env:GITHUB_ENV -Append
+                          break
+                      }
+                  }
+              }
+              
+              # Also try API as backup
+              if (-not $publicUrl) {
+                  try {
+                      $response = Invoke-RestMethod -Uri "http://localhost:4040/api/tunnels" -TimeoutSec 3 -ErrorAction SilentlyContinue
+                      $tcpTunnel = $response.tunnels | Where-Object { $_.proto -eq "tcp" }
+                      if ($tcpTunnel -and $tcpTunnel.public_url) {
+                          $publicUrl = $tcpTunnel.public_url
+                          Write-Host "✅ Ngrok URL found via API: $publicUrl"
+                          "NGROK_URL=$publicUrl" | Out-File -FilePath $env:GITHUB_ENV -Append
+                          break
+                      }
+                  } catch {
+                      # API not available yet, continue
+                  }
+              }
+              
+              $retryCount++
+              if (-not $publicUrl) {
+                  Write-Host "⏳ Waiting for Ngrok URL... ($retryCount/$maxRetries)"
+              }
+          }
+          
+          if (-not $publicUrl) {
+              Write-Host "❌ Could not get Ngrok URL automatically"
+              Write-Host "📋 Check the ngrok log manually for the URL"
+          } else {
+              Write-Host "🎉 Ngrok tunnel is ready: $publicUrl"
+          }
+
+      - name: Display Connection Information
+        run: |
+          Write-Host ""
+          Write-Host "═" * 70
+          Write-Host "🚀 RDP ACCESS INFORMATION - NGROK"
+          Write-Host "═" * 70
+          
+          if ($env:NGROK_URL) {
+              $cleanUrl = $env:NGROK_URL -replace 'tcp://', ''
+              Write-Host "🌐 PUBLIC RDP URL: $cleanUrl"
+              Write-Host "👤 USERNAME: $env:RDP_USER" 
+              Write-Host "🔑 PASSWORD: $env:RDP_PASSWORD"
+              Write-Host ""
+              Write-Host "📋 HOW TO CONNECT:"
+              Write-Host "   1. Open Remote Desktop Connection (mstsc.exe)"
+              Write-Host "   2. Computer: $cleanUrl"
+              Write-Host "   3. Username: $env:RDP_USER"
+              Write-Host "   4. Password: $env:RDP_PASSWORD"
+              Write-Host ""
+              Write-Host "⚠️  IMPORTANT:"
+              Write-Host "   - This session will auto-end after 60 minutes"
+              Write-Host "   - URL is temporary and will change each run"
+          } else {
+              Write-Host "❌ Ngrok URL not available"
+              Write-Host "🔧 Troubleshooting steps:"
+              Write-Host "   1. Check workflow logs for errors"
+              Write-Host "   2. Ensure port 3389 is not blocked"
+              Write-Host "   3. Try re-running the workflow"
+              Write-Host ""
+              Write-Host "👤 USERNAME: $env:RDP_USER"
+              Write-Host "🔑 PASSWORD: $env:RDP_PASSWORD"
+          }
+          
+          Write-Host ""
+          Write-Host "⏰ Session timeout: 60 minutes"
+          Write-Host "═" * 70
+          Write-Host ""
+
+      - name: Monitor and Maintain Connection
+        run: |
+          Write-Host "🔄 Starting connection monitoring..."
+          $startTime = Get-Date
+          $timeoutMinutes = 55
+          $lastUrl = $env:NGROK_URL
+          
+          function Test-NgrokActive {
+              # Test if ngrok process is running
+              $process = Get-Process -Id $env:NGROK_PID -ErrorAction SilentlyContinue
+              return [bool]$process
+          }
+          
+          function Get-NgrokURLFromLog {
+              $logPath = "$env:TEMP\ngrok_log.txt"
+              if (Test-Path $logPath) {
+                  $logContent = Get-Content $logPath -Tail 50 -ErrorAction SilentlyContinue
+                  foreach ($line in $logContent) {
+                      if ($line -match "url=tcp://(.+:\d+)" -or $line -match "tcp://([a-z0-9.-]+:\d+)") {
+                          return $matches[0]
+                      }
+                  }
+              }
+              return $null
+          }
+          
+          function Restart-NgrokTunnel {
+              Write-Host "🔄 Restarting Ngrok tunnel..."
+              # Kill existing
+              Get-Process -Name "ngrok" -ErrorAction SilentlyContinue | Stop-Process -Force
+              Start-Sleep -Seconds 3
+              
+              # Start new
+              $logPath = "$env:TEMP\ngrok_log.txt"
+              $process = Start-Process -FilePath "$env:NGROK_PATH\ngrok.exe" `
+                -ArgumentList "tcp 3389 --log stdout" `
+                -RedirectStandardOutput $logPath `
+                -PassThru `
+                -WindowStyle Hidden
+              
+              "NGROK_PID=$($process.Id)" | Out-File -FilePath $env:GITHUB_ENV -Append
+              Start-Sleep -Seconds 10
+              
+              # Get new URL
+              $newUrl = Get-NgrokURLFromLog
+              if ($newUrl) {
+                  Write-Host "✅ Ngrok restarted with URL: $newUrl"
+                  return $newUrl
+              }
+              return $null
+          }
+          
+          # Main monitoring loop
+          while ($true) {
+              $elapsed = (Get-Date) - $startTime
+              $remaining = $timeoutMinutes - $elapsed.TotalMinutes
+              
+              if ($remaining -le 0) {
+                  Write-Host "⏰ Timeout reached - Session ending"
+                  break
+              }
+              
+              $statusTime = Get-Date -Format "HH:mm:ss"
+              Write-Host "[$statusTime] 🟢 RDP Active - $([math]::Ceiling($remaining)) min remaining"
+              
+              # Check Ngrok status
+              if (-not (Test-NgrokActive)) {
+                  Write-Host "⚠️  Ngrok not running, restarting..."
+                  $newUrl = Restart-NgrokTunnel
+                  if ($newUrl) {
+                      $lastUrl = $newUrl
+                      Write-Host "🔗 New URL: $($newUrl -replace 'tcp://', '')"
+                  }
+              }
+              
+              # Check RDP service
+              $rdpService = Get-Service -Name TermService -ErrorAction SilentlyContinue
+              if ($rdpService.Status -ne 'Running') {
+                  Write-Host "⚠️  Restarting RDP service..."
+                  Start-Service -Name TermService -Force
+              }
+              
+              # Display current connection info periodically
+              if ([math]::Round($elapsed.TotalMinutes) % 5 -eq 0) {
+                  if ($lastUrl) {
+                      $cleanUrl = $lastUrl -replace 'tcp://', ''
+                      Write-Host "🔗 Current RDP URL: $cleanUrl"
+                  }
+                  Write-Host "👤 Username: $env:RDP_USER"
+              }
+              
+              Start-Sleep -Seconds 60
+          }
